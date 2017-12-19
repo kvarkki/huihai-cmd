@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+# vim: softtabstop=4 shiftwidth=4 noexpandtab
+
+VERSION = "20171219"
+
+import argparse
+import sys
+import pathlib
+import urllib.request
+import http.cookiejar
+import hashlib
+import base64
+import lxml.etree
+
+def eprint(*args, **kwargs):
+	print(*args, file = sys.stderr, **kwargs)
+
+class Configuration(object):
+	def __init__(self):
+		self.address = "192.168.8.1"
+		self.username = "admin"
+		self.password = "admin"
+
+	def Load(self, config_file):
+		code = compile(config_file.read_text(encoding = "UTF-8"), config_file.name, "exec")
+		g = {}
+		l = {
+			"address": self.address,
+			"username": self.username,
+			"password": self.password
+		}
+		exec(code, g, l)
+		self.address = l["address"]
+		self.username = l["username"]
+		self.password = l["password"]
+
+class XML_Request(object):
+	def __init__(self):
+		self.request = lxml.etree.Element("request")
+
+	def Append(self, element, data):
+		new_element = lxml.etree.Element(element)
+		new_element.text = data
+		self.request.append(new_element)
+
+	def XML(self):
+		return lxml.etree.tostring(self.request, xml_declaration = True, encoding = "UTF-8")
+
+def Get_Error(element):
+	code = ""
+	message = ""
+	try:
+		code = element.xpath('code/text()')[0]
+	except IndexError:
+		pass
+	try:
+		message = element.xpath('message/text()')[0]
+	except IndexError:
+		pass
+	return "Error code {0} message '{1}'".format(code, message)
+
+def XML_Is_OK(data_xml):
+	#print(data_xml)
+	document = lxml.etree.XML(data_xml)
+	errors = document.xpath('/error')
+	if errors:
+		raise Exception("XML_Is_OK: {}".format(Get_Error(errors[0])))
+
+def XML_Get_Data(data_xml):
+	#print(data_xml)
+	document = lxml.etree.XML(data_xml)
+	errors = document.xpath('/error')
+	if errors:
+		raise Exception("XML_Get_Data: error code {}".format(Get_Error(errors[0])))
+	else:
+		data = dict()
+		for item in document.xpath('/response/*'):
+			data[item.tag] = item.text
+		return data
+
+def Password_Hash(name, password, token):
+	def SHA256(data):
+		return hashlib.new("sha256", data).hexdigest().encode("UTF-8")
+
+	return base64.b64encode(
+		SHA256(
+			name.encode("UTF-8") + base64.b64encode(
+				SHA256(password.encode("UTF-8"))
+			) + token.encode("UTF-8")
+		)
+	).decode("UTF-8")
+
+class Tokens(object):
+	def __init__(self):
+		self.tokens = list()
+
+	def Top(self):
+		return self.tokens[0]
+
+	def Pop(self):
+		self.tokens = self.tokens[1:]
+
+	def Reset(self, tokens = list()):
+		self.tokens = tokens
+
+class Handler(urllib.request.BaseHandler):
+	def __init__(self, tokens):
+		self.tokens = tokens
+
+	def http_request(self, request):
+		if request.get_method() == "POST":
+			request.add_header("__RequestVerificationToken", self.tokens.Top())
+			self.tokens.Pop()
+		return request
+
+	def http_response(self, request, response):
+		if "/html/" in request.selector:
+			try:
+				self.tokens.Reset(
+					lxml.etree.HTML(response.read()).xpath('/html/head/meta[@name = "csrf_token"]/@content')
+				)
+			except Exception as error:
+				eprint("Exception Handler.http_response:", error)
+		return response
+
+	https_request = http_request
+	https_response = http_response
+
+class Session(object):
+	def __init__(self, config):
+		self.base_uri = "http://" + config.address
+		self.username = config.username
+		self.password = config.password
+		self.cookiejar = http.cookiejar.CookieJar()
+		self.tokens = Tokens()
+		self.http = urllib.request.build_opener(
+			urllib.request.HTTPCookieProcessor(self.cookiejar),
+			Handler(self.tokens)
+		)
+
+	def Get(self, path):
+		req = urllib.request.Request(
+			url = self.base_uri + path,
+			method = "GET"
+		)
+		with self.http.open(req, timeout = 5) as response:
+			return response.read()
+
+	def Post(self, path, data):
+		req = urllib.request.Request(
+			url = self.base_uri + path,
+			method = "POST",
+			data = data
+		)
+		with self.http.open(req, timeout = 5) as response:
+			return response.read()
+
+	def Login(self):
+		self.Get("/html/home.html") # get tokens
+		tmp = XML_Request()
+		tmp.Append("Username", self.username)
+		tmp.Append("Password", Password_Hash(self.username, self.password, self.tokens.Top()))
+		tmp.Append("password_type", "4")
+		data = self.Post("/api/user/login", tmp.XML())
+		XML_Is_OK(data)
+
+	def Query(self, path):
+		data = self.Get(path)
+		return XML_Get_Data(data)
+
+	def Reboot(self):
+		self.Get("/html/home.html")
+		tmp = XML_Request()
+		tmp.Append("Control", "1")
+		data = self.Post("/api/device/control", tmp.XML())
+		XML_Is_OK(data)
+
+	def Disconnect(self):
+		self.Get("/html/home.html")
+		tmp = XML_Request()
+		tmp.Append("dataswitch", "0")
+		data = self.Post("/api/dialup/mobile-dataswitch", tmp.XML())
+		XML_Is_OK(data)
+
+	def Connect(self):
+		self.Get("/html/home.html")
+		tmp = XML_Request()
+		tmp.Append("dataswitch", "1")
+		data = self.Post("/api/dialup/mobile-dataswitch", tmp.XML())
+		XML_Is_OK(data)
+
+	def Status(self):
+		return self.Query("/api/monitoring/status")
+
+	def Traffic(self):
+		return self.Query("/api/monitoring/traffic-statistics")
+
+	def Signal(self):
+		return self.Query("/api/device/signal")
+
+	def Antenna(self):
+		return self.Query("/api/device/antenna_status")
+
+	def Information(self):
+		return self.Query("/api/device/information")
+
+	def Mode_List(self):
+		return self.Query("/api/net/net-mode-list")
+
+	def Mode(self):
+		return self.Query("/api/net/net-mode")
+
+def Print_Response(data):
+	for key, value in data.items():
+		print("{0}: '{1}'".format(key, value))
+
+def Main():
+	commands = {
+		"reboot": lambda router: router.Reboot(),
+		"disconnect": lambda router: router.Disconnect(),
+		"connect": lambda router: router.Connect(),
+		"status": lambda router: Print_Response(router.Status()),
+		"trafic": lambda router: Print_Response(router.Traffic()),
+		"signal": lambda router: Print_Response(router.Signal()),
+		"antenna": lambda router: Print_Response(router.Antenna()),
+		"information": lambda router: Print_Response(router.Information()),
+		"mode_list": lambda router: Print_Response(router.Mode_List()),
+		"mode": lambda router: Print_Response(router.Mode())
+	}
+	parser = argparse.ArgumentParser(description = "Huihai Commander")
+	parser.add_argument("--version", action = "version", version = VERSION)
+	parser.add_argument("--config", help = "configuration file", default = "~/.config/huihai/config")
+	parser.add_argument("--address", help = "router's address", default = None)
+	parser.add_argument("--username", help = "username", default = None)
+	parser.add_argument("--password", help = "password", default = None)
+	parser.add_argument("command", help = "command to router", choices = commands.keys())
+	args = parser.parse_args()
+	config = Configuration()
+	try:
+		config.Load(pathlib.Path(args.config).expanduser())
+	except Exception as error:
+		print("Configuration: {}".format(error))
+	if args.address:
+		config.address = args.address
+	if args.username:
+		config.username = args.username
+	if args.password:
+		config.password = args.password
+	try:
+		router = Session(config)
+		router.Login()
+		commands[args.command](router)
+	except Exception as error:
+		eprint("Exception Main:", error)
+
+if __name__ == "__main__":
+	Main()
